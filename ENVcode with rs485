@@ -1,0 +1,443 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <DHT.h>
+#include <Wire.h>
+#include <Arduino.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+// ================= PIN DEFINITIONS =================
+#define DHTPIN              27
+#define ENABLE_PIN          19
+#define TEMP_PIN            18
+#define PH_PIN              36
+#define TDS_PIN             39
+#define MOISTURE_SENSOR_PIN 33
+#define BSENS_PIN           32
+#define DHTTYPE             DHT11
+
+// ================= WIFI AND AUTH =================
+const char* ssid = "ADME.Tech | THG";
+const char* password = "12345678";
+const char* mdnsName = "THG";
+
+WebServer server(80);
+
+const char* login_username = "admin";
+const char* login_password = "admin";
+bool isAuthenticated = false;
+
+// ================= SENSOR OBJECT =================
+DHT dht(DHTPIN, DHTTYPE);
+OneWire oneWire(TEMP_PIN);
+DallasTemperature waterTempSensor(&oneWire);
+
+// ================= SENSOR VARIABLES =================
+float batteryLevel = 0.0;
+float batteryVoltage = 0.0;
+float batteryAdcVoltage = 0.0;
+
+float ph = 0.0;
+float tds = 0.0;
+float liquidTemp = 0.0;
+float airTemp = 0.0;
+float humidity = 0.0;
+float universalPh = 0.0;
+float universalTds = 0.0;
+float soilMoisture = 0.0;
+float co2 = 0.0;
+float baroPressure = 0.0;
+float rgb_r = 128.0, rgb_g = 92.0, rgb_b = 240.0;
+float spec_r = 256.0, spec_g = 270.0, spec_b = 193.0, spec_c = 802.0;
+
+float rawPhADC = 0.0;
+float rawTdsADC = 0.0;
+float rawSoilADC = 0.0;
+float rawBatteryADC = 0.0;
+
+// ================= CALIBRATION FACTORS =================
+float cal_batteryLevel = 1.0;
+float cal_ph = 1.0;
+float cal_tds = 1.0;
+float cal_liquidTemp = 1.0;
+float cal_airTemp = 1.0;
+float cal_humidity = 1.0;
+float cal_universalPh = 1.0;
+float cal_universalTds = 1.0;
+float cal_soilMoisture = 1.0;
+float cal_co2 = 1.0;
+float cal_baroPressure = 1.0;
+float cal_rgb_r = 1.0, cal_rgb_g = 1.0, cal_rgb_b = 1.0;
+float cal_spec_r = 1.0, cal_spec_g = 1.0, cal_spec_b = 1.0, cal_spec_c = 1.0;
+
+// ================= ADC SETTINGS =================
+static const float ADC_REF = 3.3;
+static const int ADC_MAX = 4095;
+
+// Adjust after measuring the actual battery divider
+static const float BATTERY_DIVIDER_RATIO = 2.0;
+
+// Adjust after measuring dry and wet soil values on your actual board
+static const int SOIL_ADC_DRY = 3200;
+static const int SOIL_ADC_WET = 1200;
+
+// ================= PH SETTINGS =================
+float voltage_pH7 = 0.477;
+float voltage_pH4 = 0.512;
+
+const int phSampleCount = 30;
+const float phFilterAlpha = 0.1;
+float filteredPH = 7.0;
+
+// ================= HELPER FUNCTIONS =================
+float adcToVoltage(int raw) {
+  return (raw * ADC_REF) / ADC_MAX;
+}
+
+float constrainFloat(float value, float minVal, float maxVal) {
+  if (value < minVal) return minVal;
+  if (value > maxVal) return maxVal;
+  return value;
+}
+
+float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
+  if (in_max == in_min) return out_min;
+  return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
+}
+
+float batteryVoltageToPercent(float voltage) {
+  float percent = mapFloat(voltage, 3.20, 4.20, 0.0, 100.0);
+  return constrainFloat(percent, 0.0, 100.0);
+}
+
+float soilAdcToPercent(int raw) {
+  float percent = mapFloat((float)raw, (float)SOIL_ADC_DRY, (float)SOIL_ADC_WET, 0.0, 100.0);
+  return constrainFloat(percent, 0.0, 100.0);
+}
+
+float readPHVoltage() {
+  uint32_t total = 0;
+
+  for (int i = 0; i < phSampleCount; i++) {
+    total += analogRead(PH_PIN);
+    delay(10);
+  }
+
+  float raw = total / (float)phSampleCount;
+  rawPhADC = raw;
+  float voltage = (raw / ADC_MAX) * ADC_REF;
+  return voltage;
+}
+
+float phVoltageToValue(float voltage) {
+  float slope = (7.0 - 4.0) / (voltage_pH7 - voltage_pH4);
+  float intercept = 7.0 - (slope * voltage_pH7);
+  float phValue = (slope * voltage) + intercept;
+  return phValue * cal_ph;
+}
+
+float tdsVoltageToValue(float voltage) {
+  return (voltage * 500.0) * cal_tds;
+}
+
+// ================= HTML PAGE FUNCTIONS =================
+String loginPage(const String& msg) {
+  return
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Login</title>"
+    "<style>body{background:#fafafa;font-family:sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+    ".card{background:#fff;border-radius:8px;padding:20px 16px;max-width:320px;width:100%;box-shadow:0 2px 8px #0001}"
+    "form{display:flex;flex-direction:column}input{margin-bottom:10px;padding:7px 10px;border-radius:6px;border:1px solid #ccc;font-size:1em}"
+    "input[type=submit]{background:#0086ff;color:#fff;border:none}input[type=submit]:hover{background:#005999}"
+    "label{margin-bottom:2px}#msg{color:#d00;height:20px;text-align:center;}</style></head>"
+    "<body><div class='card'><h2>Login</h2>"
+    "<form action='/login' method='POST'>"
+    "<label>Username</label><input name='username' type='text' required>"
+    "<label>Password</label><input name='password' type='password' required>"
+    "<input type='submit' value='Login'>"
+    "<div id='msg'>" + msg + "</div></form></div></body></html>";
+}
+
+String dashboardPage() {
+  return
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>ADME.Tech | THG Test Firmware</title>"
+    "<style>body{background:#fafafa;font-family:sans-serif;margin:0;padding:0}"
+    "nav{background:#0086ff;padding:12px 10px;text-align:center;}"
+    "nav a{margin:0 13px;color:#fff;text-decoration:none;font-weight:bold;}"
+    "nav a.active{color:#222;text-decoration:underline;}"
+    "h2{margin:18px 0 12px 0;text-align:center;}"
+    "table{margin:0 auto;border-collapse:collapse;}"
+    "td{padding:7px 18px;border-bottom:1px solid #eee;}"
+    "tr:last-child td{border-bottom:none;}"
+    "@media(max-width:480px){td{padding:7px 5px;}}</style>"
+    "</head><body>"
+    "<nav>"
+      "<a href='/dashboard' class='active'>Dashboard</a>"
+      "<a href='/calibration'>Calibration</a>"
+      "<a href='/logout'>Logout</a>"
+    "</nav>"
+    "<h2>ADME.Tech | THG Test Firmware</h2>"
+    "<table>"
+      "<tr><td>Battery</td><td>" + String(batteryLevel, 1) + " %</td></tr>"
+      "<tr><td>Battery Voltage</td><td>" + String(batteryVoltage, 3) + " V</td></tr>"
+      "<tr><td>pH</td><td>" + String(ph, 2) + "</td></tr>"
+      "<tr><td>TDS</td><td>" + String(tds, 1) + " ppm</td></tr>"
+      "<tr><td>Liquid Temp</td><td>" + String(liquidTemp * cal_liquidTemp, 1) + " &deg;C</td></tr>"
+      "<tr><td>Air Temp</td><td>" + String(airTemp, 1) + " &deg;C</td></tr>"
+      "<tr><td>Humidity</td><td>" + String(humidity, 1) + " %</td></tr>"
+      "<tr><td>Universal pH</td><td>" + String(universalPh, 2) + "</td></tr>"
+      "<tr><td>Universal TDS</td><td>" + String(universalTds, 1) + " ppm</td></tr>"
+      "<tr><td>Soil Moisture</td><td>" + String(soilMoisture, 1) + " %</td></tr>"
+      "<tr><td>CO&#8322; Level</td><td>" + String(co2 * cal_co2, 0) + " ppm</td></tr>"
+      "<tr><td>Barometric Pressure</td><td>" + String(baroPressure * cal_baroPressure, 1) + " hPa</td></tr>"
+      "<tr><td>RGB Color Sensor</td><td>R:" + String(rgb_r * cal_rgb_r, 0) + " G:" + String(rgb_g * cal_rgb_g, 0) + " B:" + String(rgb_b * cal_rgb_b, 0) + "</td></tr>"
+      "<tr><td>Spectral Sensor</td><td>R:" + String(spec_r * cal_spec_r, 0) + " G:" + String(spec_g * cal_spec_g, 0) + " B:" + String(spec_b * cal_spec_b, 0) + " C:" + String(spec_c * cal_spec_c, 0) + "</td></tr>"
+      "<tr><td>Raw pH ADC</td><td>" + String(rawPhADC, 0) + "</td></tr>"
+      "<tr><td>Raw TDS ADC</td><td>" + String(rawTdsADC, 0) + "</td></tr>"
+      "<tr><td>Raw Soil ADC</td><td>" + String(rawSoilADC, 0) + "</td></tr>"
+      "<tr><td>Raw Battery ADC</td><td>" + String(rawBatteryADC, 0) + "</td></tr>"
+    "</table>"
+    "</body></html>";
+}
+
+String calibrationPage(const String& msg = "") {
+  return
+    "<!DOCTYPE html><html><head><meta charset='UTF-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<title>Calibration</title>"
+    "<style>body{background:#fafafa;font-family:sans-serif;margin:0;padding:0}"
+    "nav{background:#0086ff;padding:12px 10px;text-align:center;}"
+    "nav a{margin:0 13px;color:#fff;text-decoration:none;font-weight:bold;}"
+    "nav a.active{color:#222;text-decoration:underline;}"
+    "h2{margin:18px 0 12px 0;text-align:center;}"
+    "section{max-width:370px;margin:0 auto;background:#fff;padding:14px 16px;border-radius:8px;box-shadow:0 1px 5px #0001;}"
+    "label{display:block;margin-bottom:7px;}"
+    "input[type=number]{width:80px;margin-bottom:6px;}"
+    "input[type=submit]{background:#0086ff;color:#fff;border:none;padding:8px 21px;border-radius:6px;font-size:1em;}"
+    "input[type=submit]:hover{background:#005999}.msg{color:#080;margin:7px 0;text-align:center;font-size:0.96em;}"
+    "@media(max-width:480px){section{padding:10px 4px;}}</style>"
+    "</head><body>"
+    "<nav>"
+      "<a href='/dashboard'>Dashboard</a>"
+      "<a href='/calibration' class='active'>Calibration</a>"
+      "<a href='/logout'>Logout</a>"
+    "</nav>"
+    "<h2>Calibration</h2>"
+    "<section>"
+    "<form action='/calibration' method='POST'>"
+    "<label>Battery Calibration <input type='number' step='0.01' name='cal_batteryLevel' value='" + String(cal_batteryLevel,2) + "'></label>"
+    "<label>pH Calibration <input type='number' step='0.01' name='cal_ph' value='" + String(cal_ph,2) + "'></label>"
+    "<label>TDS Calibration <input type='number' step='0.01' name='cal_tds' value='" + String(cal_tds,2) + "'></label>"
+    "<label>Liquid Temp Calibration <input type='number' step='0.01' name='cal_liquidTemp' value='" + String(cal_liquidTemp,2) + "'></label>"
+    "<label>Air Temp Calibration <input type='number' step='0.01' name='cal_airTemp' value='" + String(cal_airTemp,2) + "'></label>"
+    "<label>Humidity Calibration <input type='number' step='0.01' name='cal_humidity' value='" + String(cal_humidity,2) + "'></label>"
+    "<label>Universal pH Calibration <input type='number' step='0.01' name='cal_universalPh' value='" + String(cal_universalPh,2) + "'></label>"
+    "<label>Universal TDS Calibration <input type='number' step='0.01' name='cal_universalTds' value='" + String(cal_universalTds,2) + "'></label>"
+    "<label>Soil Moisture Calibration <input type='number' step='0.01' name='cal_soilMoisture' value='" + String(cal_soilMoisture,2) + "'></label>"
+    "<label>CO&#8322; Calibration <input type='number' step='0.01' name='cal_co2' value='" + String(cal_co2,2) + "'></label>"
+    "<label>Barometric Pressure Calibration <input type='number' step='0.01' name='cal_baroPressure' value='" + String(cal_baroPressure,2) + "'></label>"
+    "<label>RGB Red Calibration <input type='number' step='0.01' name='cal_rgb_r' value='" + String(cal_rgb_r,2) + "'></label>"
+    "<label>RGB Green Calibration <input type='number' step='0.01' name='cal_rgb_g' value='" + String(cal_rgb_g,2) + "'></label>"
+    "<label>RGB Blue Calibration <input type='number' step='0.01' name='cal_rgb_b' value='" + String(cal_rgb_b,2) + "'></label>"
+    "<label>Spectral Red Calibration <input type='number' step='0.01' name='cal_spec_r' value='" + String(cal_spec_r,2) + "'></label>"
+    "<label>Spectral Green Calibration <input type='number' step='0.01' name='cal_spec_g' value='" + String(cal_spec_g,2) + "'></label>"
+    "<label>Spectral Blue Calibration <input type='number' step='0.01' name='cal_spec_b' value='" + String(cal_spec_b,2) + "'></label>"
+    "<label>Spectral Clear Calibration <input type='number' step='0.01' name='cal_spec_c' value='" + String(cal_spec_c,2) + "'></label>"
+    "<input type='submit' value='Save'>"
+    "</form>"
+    + (msg.length() > 0 ? "<div class='msg'>" + msg + "</div>" : "")
+    + "</section>"
+    "</body></html>";
+}
+
+// ================= HTTP HANDLERS =================
+void handleRoot() {
+  if (isAuthenticated) {
+    server.sendHeader("Location", "/dashboard", true);
+    server.send(302, "text/plain", "");
+  } else {
+    server.send(200, "text/html", loginPage(""));
+  }
+}
+
+void handleLogin() {
+  if (server.method() == HTTP_POST) {
+    String u = server.arg("username");
+    String p = server.arg("password");
+
+    if (u == login_username && p == login_password) {
+      isAuthenticated = true;
+      server.sendHeader("Location", "/dashboard", true);
+      server.send(302, "text/plain", "");
+    } else {
+      server.send(200, "text/html", loginPage("Invalid credentials!"));
+    }
+  } else {
+    server.send(405, "text/plain", "Method Not Allowed");
+  }
+}
+
+void handleDashboard() {
+  if (!isAuthenticated) {
+    server.sendHeader("Location", "/", true);
+    server.send(302, "text/plain", "");
+    return;
+  }
+  server.send(200, "text/html", dashboardPage());
+}
+
+void handleCalibration() {
+  if (!isAuthenticated) {
+    server.sendHeader("Location", "/", true);
+    server.send(302, "text/plain", "");
+    return;
+  }
+
+  if (server.method() == HTTP_POST) {
+    if (server.hasArg("cal_batteryLevel")) cal_batteryLevel = server.arg("cal_batteryLevel").toFloat();
+    if (server.hasArg("cal_ph")) cal_ph = server.arg("cal_ph").toFloat();
+    if (server.hasArg("cal_tds")) cal_tds = server.arg("cal_tds").toFloat();
+    if (server.hasArg("cal_liquidTemp")) cal_liquidTemp = server.arg("cal_liquidTemp").toFloat();
+    if (server.hasArg("cal_airTemp")) cal_airTemp = server.arg("cal_airTemp").toFloat();
+    if (server.hasArg("cal_humidity")) cal_humidity = server.arg("cal_humidity").toFloat();
+    if (server.hasArg("cal_universalPh")) cal_universalPh = server.arg("cal_universalPh").toFloat();
+    if (server.hasArg("cal_universalTds")) cal_universalTds = server.arg("cal_universalTds").toFloat();
+    if (server.hasArg("cal_soilMoisture")) cal_soilMoisture = server.arg("cal_soilMoisture").toFloat();
+    if (server.hasArg("cal_co2")) cal_co2 = server.arg("cal_co2").toFloat();
+    if (server.hasArg("cal_baroPressure")) cal_baroPressure = server.arg("cal_baroPressure").toFloat();
+    if (server.hasArg("cal_rgb_r")) cal_rgb_r = server.arg("cal_rgb_r").toFloat();
+    if (server.hasArg("cal_rgb_g")) cal_rgb_g = server.arg("cal_rgb_g").toFloat();
+    if (server.hasArg("cal_rgb_b")) cal_rgb_b = server.arg("cal_rgb_b").toFloat();
+    if (server.hasArg("cal_spec_r")) cal_spec_r = server.arg("cal_spec_r").toFloat();
+    if (server.hasArg("cal_spec_g")) cal_spec_g = server.arg("cal_spec_g").toFloat();
+    if (server.hasArg("cal_spec_b")) cal_spec_b = server.arg("cal_spec_b").toFloat();
+    if (server.hasArg("cal_spec_c")) cal_spec_c = server.arg("cal_spec_c").toFloat();
+
+    server.send(200, "text/html", calibrationPage("Calibration saved!"));
+  } else {
+    server.send(200, "text/html", calibrationPage());
+  }
+}
+
+void handleLogout() {
+  isAuthenticated = false;
+  server.sendHeader("Location", "/", true);
+  server.send(302, "text/plain", "");
+}
+
+// ================= SENSOR UPDATE =================
+void updateSensors() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+
+  if (!isnan(h) && !isnan(t)) {
+    humidity = h * cal_humidity;
+    airTemp = t * cal_airTemp;
+  }
+
+  float phVoltage = readPHVoltage();
+  float phValue = phVoltageToValue(phVoltage);
+  filteredPH = (1.0 - phFilterAlpha) * filteredPH + (phFilterAlpha * phValue);
+  ph = filteredPH;
+
+  int rawTds = analogRead(TDS_PIN);
+  int rawSoil = analogRead(MOISTURE_SENSOR_PIN);
+  int rawBattery = analogRead(BSENS_PIN);
+
+  rawTdsADC = rawTds;
+  rawSoilADC = rawSoil;
+  rawBatteryADC = rawBattery;
+
+  float tdsVoltage = adcToVoltage(rawTds);
+  batteryAdcVoltage = adcToVoltage(rawBattery);
+
+  tds = tdsVoltageToValue(tdsVoltage);
+
+  soilMoisture = soilAdcToPercent(rawSoil) * cal_soilMoisture;
+  soilMoisture = constrainFloat(soilMoisture, 0.0, 100.0);
+
+  batteryVoltage = batteryAdcVoltage * BATTERY_DIVIDER_RATIO;
+  batteryLevel = batteryVoltageToPercent(batteryVoltage) * cal_batteryLevel;
+  batteryLevel = constrainFloat(batteryLevel, 0.0, 100.0);
+
+  universalPh = ph * cal_universalPh;
+  universalTds = tds * cal_universalTds;
+
+  waterTempSensor.requestTemperatures();
+  float tempC = waterTempSensor.getTempCByIndex(0);
+
+  if (tempC != DEVICE_DISCONNECTED_C) {
+    liquidTemp = tempC;
+  } else {
+    liquidTemp = 0.0;
+  }
+}
+
+// ================= SERIAL DEBUG =================
+void printSensors() {
+  Serial.println("========== LIVE SENSOR READINGS ==========");
+  Serial.print("Air Temp: "); Serial.print(airTemp); Serial.println(" C");
+  Serial.print("Humidity: "); Serial.print(humidity); Serial.println(" %");
+  Serial.print("pH: "); Serial.println(ph, 2);
+  Serial.print("TDS: "); Serial.print(tds); Serial.println(" ppm");
+  Serial.print("Liquid Temp: "); Serial.print(liquidTemp); Serial.println(" C");
+  Serial.print("Soil Moisture: "); Serial.print(soilMoisture); Serial.println(" %");
+  Serial.print("Battery Voltage: "); Serial.print(batteryVoltage, 3); Serial.println(" V");
+  Serial.print("Battery Level: "); Serial.print(batteryLevel); Serial.println(" %");
+  Serial.print("Raw pH ADC: "); Serial.println(rawPhADC);
+  Serial.print("Raw TDS ADC: "); Serial.println(rawTdsADC);
+  Serial.print("Raw Soil ADC: "); Serial.println(rawSoilADC);
+  Serial.print("Raw Battery ADC: "); Serial.println(rawBatteryADC);
+  Serial.println("==========================================");
+}
+
+// ================= SETUP =================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(ENABLE_PIN, OUTPUT);
+  digitalWrite(ENABLE_PIN, HIGH);
+  Serial.println("Moisture Sensor Powered On.");
+
+  pinMode(PH_PIN, INPUT);
+  pinMode(TDS_PIN, INPUT);
+  pinMode(MOISTURE_SENSOR_PIN, INPUT);
+  pinMode(BSENS_PIN, INPUT);
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(PH_PIN, ADC_11db);
+
+  delay(500);
+  dht.begin();
+  waterTempSensor.begin();
+
+  WiFi.softAP(ssid, password);
+  MDNS.begin(mdnsName);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/login", HTTP_POST, handleLogin);
+  server.on("/dashboard", HTTP_GET, handleDashboard);
+  server.on("/calibration", HTTP_GET, handleCalibration);
+  server.on("/calibration", HTTP_POST, handleCalibration);
+  server.on("/logout", HTTP_GET, handleLogout);
+  server.begin();
+
+  Serial.println("System Active");
+  Serial.println("GPIO19 sensor rail enabled");
+  Serial.println("GPIO27 DHT11 initialized");
+  Serial.println("GPIO18 water temp initialized");
+  Serial.println("GPIO36 pH sensor initialized with 2 point calibration");
+}
+
+// ================= LOOP =================
+void loop() {
+  server.handleClient();
+
+  static unsigned long lastMeasure = 0;
+  if (millis() - lastMeasure >= 2000) {
+    lastMeasure = millis();
+    updateSensors();
+    printSensors();
+  }
+}
